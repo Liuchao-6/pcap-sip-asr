@@ -10,9 +10,12 @@ import ipaddress
 import re
 import struct
 import sys
+import unicodedata
 import wave
 from array import array
+from collections import Counter
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -24,6 +27,10 @@ STATIC_CODECS = {0: ("PCMU", 8000), 8: ("PCMA", 8000)}
 
 
 class CaptureError(Exception):
+    pass
+
+
+class AsrError(Exception):
     pass
 
 
@@ -69,11 +76,49 @@ class Result:
     packet_count: int = 0
     duration: float = 0.0
     note: str = ""
+    transcript: str = ""
+    prompt_category: str = ""
+    asr_note: str = ""
 
 
 @dataclass
 class CaptureStatus:
     truncated_tail: bool = False
+
+
+@dataclass(frozen=True)
+class PromptGroup:
+    name: str
+    representative: str
+    count: int
+    variants: tuple[str, ...]
+
+
+class FasterWhisperRecognizer:
+    def __init__(self, model: str, model_dir: Path | None = None):
+        try:
+            from faster_whisper import WhisperModel
+        except (ImportError, OSError) as error:
+            raise AsrError(f"无法加载 faster-whisper：{error}") from error
+        try:
+            self._model = WhisperModel(
+                model,
+                device="cpu",
+                compute_type="int8",
+                download_root=str(model_dir) if model_dir else None,
+            )
+        except Exception as error:
+            raise AsrError(f"ASR 模型加载失败：{error}") from error
+
+    def transcribe(self, wav_path: Path) -> str:
+        segments, _info = self._model.transcribe(
+            str(wav_path),
+            language="zh",
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+        return "".join(segment.text.strip() for segment in segments).strip()
 
 
 def iter_capture(path: Path, status: CaptureStatus | None = None) -> Iterator[tuple[float, int, bytes]]:
@@ -531,12 +576,88 @@ def process_file(source: Path, output: Path, status_filter: str) -> Result:
     return result
 
 
+def transcribe_unanswered(results: list[Result], recognizer) -> None:
+    for result in results:
+        if result.answered:
+            continue
+        if result.wav is None:
+            result.asr_note = "无可识别录音"
+            continue
+        if recognizer is None:
+            continue
+        try:
+            result.transcript = recognizer.transcribe(result.wav)
+            result.asr_note = "识别成功" if result.transcript else "未识别到语音"
+        except Exception as error:
+            result.asr_note = f"识别失败：{error}"
+
+
+def normalize_transcript(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = "".join(character for character in normalized if character.isalnum())
+    return re.sub(r"\d+", "0", normalized)
+
+
+def transcript_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right, autojunk=False).ratio()
+
+
+def classify_transcripts(results: list[Result], threshold: float = 0.82) -> list[PromptGroup]:
+    variants: dict[str, list[Result]] = {}
+    for result in results:
+        normalized = normalize_transcript(result.transcript)
+        if normalized:
+            variants.setdefault(normalized, []).append(result)
+    texts = sorted(variants)
+    parents = list(range(len(texts)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left in range(len(texts)):
+        for right in range(left + 1, len(texts)):
+            if transcript_similarity(texts[left], texts[right]) >= threshold:
+                union(left, right)
+
+    clusters: dict[int, list[Result]] = {}
+    for index, text in enumerate(texts):
+        clusters.setdefault(find(index), []).extend(variants[text])
+
+    prepared: list[tuple[str, list[Result], tuple[str, ...]]] = []
+    for members in clusters.values():
+        counts = Counter(item.transcript.strip() for item in members)
+        representative = min(counts, key=lambda value: (-counts[value], len(value), value))
+        ordered_variants = tuple(sorted(counts, key=lambda value: (-counts[value], value)))
+        prepared.append((representative, members, ordered_variants))
+    prepared.sort(key=lambda item: (-len(item[1]), normalize_transcript(item[0]), item[0]))
+
+    groups: list[PromptGroup] = []
+    for index, (representative, members, ordered_variants) in enumerate(prepared, 1):
+        name = f"提示音-{index:03d}"
+        for result in members:
+            result.prompt_category = name
+        groups.append(PromptGroup(name, representative, len(members), ordered_variants))
+    return groups
+
+
 def write_report(output: Path, results: list[Result]) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     path = output / "导出报告.csv"
     with path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["抓包文件", "接通状态", "WAV文件", "RTP流数", "RTP包数", "时长秒", "结果"])
+        writer.writerow(["抓包文件", "接通状态", "WAV文件", "RTP流数", "RTP包数", "时长秒", "提示音内容", "提示音分类", "ASR结果", "结果"])
         for item in results:
             writer.writerow([
                 str(item.source),
@@ -545,9 +666,33 @@ def write_report(output: Path, results: list[Result]) -> Path:
                 item.stream_count,
                 item.packet_count,
                 f"{item.duration:.3f}" if item.duration else "",
+                item.transcript,
+                item.prompt_category,
+                item.asr_note,
                 item.note,
             ])
     return path
+
+
+def write_category_report(output: Path, groups: list[PromptGroup]) -> Path:
+    output.mkdir(parents=True, exist_ok=True)
+    path = output / "提示音分类汇总.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["提示音分类", "数量", "代表内容", "识别文本变体"])
+        for group in groups:
+            writer.writerow([group.name, group.count, group.representative, " | ".join(group.variants)])
+    return path
+
+
+def similarity_threshold(value: str) -> float:
+    try:
+        threshold = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("相似度必须是 0 到 1 之间的数字") from error
+    if not 0 <= threshold <= 1:
+        raise argparse.ArgumentTypeError("相似度必须是 0 到 1 之间的数字")
+    return threshold
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -561,6 +706,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="all=全部，answered=仅接通，unanswered=仅未接通（默认：all）",
     )
     parser.add_argument("--no-recursive", action="store_true", help="不扫描输入目录的子目录")
+    parser.add_argument("--asr", action="store_true", help="对未接通 WAV 执行中文 ASR 识别")
+    parser.add_argument("--asr-model", default="small", help="faster-whisper 模型名称或本地模型目录（默认：small）")
+    parser.add_argument("--asr-model-dir", type=Path, help="模型下载和缓存目录")
+    parser.add_argument("--asr-similarity", type=similarity_threshold, default=0.82, help="提示音文本聚类阈值 0-1（默认：0.82）")
     return parser
 
 
@@ -581,11 +730,31 @@ def main(argv: list[str] | None = None) -> int:
         results.append(result)
         state = "已接通" if result.answered else "未接通"
         print(f"[{index}/{len(captures)}] {capture.name} | {state} | {result.note}")
+    if args.asr:
+        candidates = [item for item in results if not item.answered and item.wav is not None]
+        if candidates:
+            print(f"正在加载 ASR 模型：{args.asr_model}")
+            try:
+                recognizer = FasterWhisperRecognizer(args.asr_model, args.asr_model_dir)
+            except AsrError as error:
+                transcribe_unanswered(results, None)
+                for item in candidates:
+                    item.asr_note = f"识别失败：{error}"
+            else:
+                transcribe_unanswered(results, recognizer)
+                for index, item in enumerate(candidates, 1):
+                    print(f"[ASR {index}/{len(candidates)}] {item.wav.name} | {item.asr_note} | {item.transcript}")
+        else:
+            transcribe_unanswered(results, None)
+    groups = classify_transcripts(results, args.asr_similarity) if args.asr else []
+    category_report = write_category_report(output, groups) if args.asr else None
     report = write_report(output, results)
     exported = sum(item.wav is not None for item in results)
     failed = sum(item.note.startswith("处理失败") for item in results)
-    print(f"完成：导出 {exported} 个 WAV，失败 {failed} 个；报告：{report}")
-    return 2 if failed else 0
+    asr_failed = sum(item.asr_note.startswith("识别失败") for item in results)
+    category_message = f"，提示音分类 {len(groups)} 个；分类汇总：{category_report}" if category_report else ""
+    print(f"完成：导出 {exported} 个 WAV，抓包失败 {failed} 个，ASR失败 {asr_failed} 个{category_message}；报告：{report}")
+    return 2 if failed or asr_failed else 0
 
 
 if __name__ == "__main__":

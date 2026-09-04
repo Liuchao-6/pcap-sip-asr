@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 python-3.10.21-centos7-x86_64-offline/
+models/
+models.zip

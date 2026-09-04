@@ -96,6 +96,78 @@ class ToolTests(unittest.TestCase):
             with report.open(encoding="utf-8-sig", newline="") as source:
                 rows = list(csv.reader(source))
             self.assertEqual(rows[1][1], "已接通")
+            self.assertEqual(rows[0][-4:], ["提示音内容", "提示音分类", "ASR结果", "结果"])
+
+    def test_asr_only_transcribes_unanswered_wav(self):
+        class Recognizer:
+            def __init__(self):
+                self.paths = []
+
+            def transcribe(self, path):
+                self.paths.append(path)
+                return "您拨打的号码暂时无法接通"
+
+        unanswered = tool.Result(Path("unanswered.pcap"), wav=Path("unanswered.wav"))
+        answered = tool.Result(Path("answered.pcap"), answered=True, wav=Path("answered.wav"))
+        no_audio = tool.Result(Path("no-audio.pcap"))
+        recognizer = Recognizer()
+
+        tool.transcribe_unanswered([unanswered, answered, no_audio], recognizer)
+
+        self.assertEqual(recognizer.paths, [Path("unanswered.wav")])
+        self.assertEqual(unanswered.transcript, "您拨打的号码暂时无法接通")
+        self.assertEqual(unanswered.asr_note, "识别成功")
+        self.assertEqual(answered.asr_note, "")
+        self.assertEqual(no_audio.asr_note, "无可识别录音")
+
+    def test_asr_failure_does_not_stop_other_results(self):
+        class Recognizer:
+            def transcribe(self, _path):
+                raise RuntimeError("bad audio")
+
+        result = tool.Result(Path("unanswered.pcap"), wav=Path("unanswered.wav"))
+
+        tool.transcribe_unanswered([result], Recognizer())
+
+        self.assertEqual(result.asr_note, "识别失败：bad audio")
+
+    def test_similar_transcripts_are_grouped_and_distinct_prompts_stay_separate(self):
+        results = [
+            tool.Result(Path("a.pcap"), transcript="您拨打的号码暂时无法接通，请稍后再拨。"),
+            tool.Result(Path("b.pcap"), transcript="您拨打的号码暂时无法接通请稍后再拨"),
+            tool.Result(Path("c.pcap"), transcript="您拨打的用户暂时无法接通，请稍后再拨"),
+            tool.Result(Path("d.pcap"), transcript="您拨打的用户已关机"),
+        ]
+
+        groups = tool.classify_transcripts(results)
+
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0].count, 3)
+        self.assertEqual(results[0].prompt_category, "提示音-001")
+        self.assertEqual(results[1].prompt_category, "提示音-001")
+        self.assertEqual(results[2].prompt_category, "提示音-001")
+        self.assertEqual(results[3].prompt_category, "提示音-002")
+
+    def test_transcript_normalization_ignores_punctuation_and_number_values(self):
+        left = tool.normalize_transcript("号码 138-0013-8000 暂停服务！")
+        right = tool.normalize_transcript("号码13900139000暂停服务")
+
+        self.assertEqual(left, right)
+
+    def test_category_report_contains_representative_and_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = [
+                tool.Result(Path("a.pcap"), transcript="线路忙，请稍后再拨"),
+                tool.Result(Path("b.pcap"), transcript="线路忙请稍后再拨"),
+            ]
+            groups = tool.classify_transcripts(results)
+
+            report = tool.write_category_report(Path(directory), groups)
+
+            with report.open(encoding="utf-8-sig", newline="") as source:
+                rows = list(csv.reader(source))
+            self.assertEqual(rows[0], ["提示音分类", "数量", "代表内容", "识别文本变体"])
+            self.assertEqual(rows[1][0:2], ["提示音-001", "2"])
 
     def test_unanswered_filter_skips_answered_capture(self):
         with tempfile.TemporaryDirectory() as directory:

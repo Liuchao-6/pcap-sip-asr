@@ -6,6 +6,7 @@
 - 没有发现上述响应时判定为“未接通”。
 - 将 G.711 PCMA（Payload Type 8）和 PCMU（Payload Type 0）RTP 音频合成为单声道 WAV。
 - 输出 `导出报告.csv`，便于按文件查看状态、录音时长和失败原因。
+- 可选使用本地 `faster-whisper` 对未接通录音进行中文 ASR，在报告中直接给出提示音内容。
 
 工具只读取原抓包，不移动或修改原文件。文件名会原样保留，例如 `时间-主叫-被叫-id.pcap` 会导出为 `时间-主叫-被叫-id.wav`。
 
@@ -47,6 +48,38 @@ py -3 .\pcapsip2wav.py "D:\抓包目录" --no-recursive
 ```
 
 也可以把单个抓包文件作为输入。
+
+## CentOS 7 提示音识别
+
+安装 Python 3.10 后，在可联网的 CentOS 7.9 x86_64 服务器安装 ASR 依赖：
+
+```bash
+python3.10 -m pip install -r requirements-asr-centos7.txt
+```
+
+只导出未接通录音并识别中文提示音：
+
+```bash
+python3.10 pcapsip2wav.py /data/pcap -o /data/wav_output --status unanswered --asr
+```
+
+默认使用 CPU、`int8` 和 `small` 模型。首次运行会联网下载模型，后续使用本地缓存。可指定缓存目录或更高精度模型：
+
+```bash
+python3.10 pcapsip2wav.py /data/pcap -o /data/wav_output --status unanswered --asr \
+  --asr-model medium --asr-model-dir /data/asr-models
+```
+
+`small` 适合先验证速度和识别效果；`medium` 通常更准确，但模型更大、CPU 识别更慢。ASR 只处理“未接通且成功生成 WAV”的文件，识别内容写入 `导出报告.csv` 的“提示音内容”列。单条识别失败会记录在“ASR结果”列，不影响其他文件继续处理。
+
+识别结束后，工具会自动合并内容相同或相似的提示音：忽略空格、标点、全角半角以及具体数字差异，并按文本相似度聚类。`导出报告.csv` 中会增加“提示音分类”，输出目录还会生成 `提示音分类汇总.csv`，按数量列出每类提示音的代表内容和识别文本变体。
+
+默认相似度阈值是 `0.82`。阈值越低，越容易把不同内容合并；阈值越高，分类越严格。可按实际识别效果调整：
+
+```bash
+python3.10 pcapsip2wav.py /data/pcap -o /data/wav_output --status unanswered --asr \
+  --asr-model /data/asr-models/faster-whisper-small --asr-similarity 0.82
+```
 
 ## 判定和格式边界
 
