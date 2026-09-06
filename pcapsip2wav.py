@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch-export G.711 RTP audio from pcap/pcapng files to WAV."""
+"""Export G.711 RTP audio from captures and transcribe WAV files."""
 
 from __future__ import annotations
 
@@ -32,6 +32,30 @@ class CaptureError(Exception):
 
 class AsrError(Exception):
     pass
+
+
+class TranslationError(Exception):
+    pass
+
+
+WHISPER_LANGUAGE_NAMES_ZH = {
+    "zh": "中文",
+    "en": "英语",
+    "es": "西班牙语",
+    "fr": "法语",
+    "de": "德语",
+    "it": "意大利语",
+    "pt": "葡萄牙语",
+    "ru": "俄语",
+    "ja": "日语",
+    "ko": "韩语",
+    "ar": "阿拉伯语",
+    "hi": "印地语",
+    "th": "泰语",
+    "vi": "越南语",
+    "id": "印度尼西亚语",
+    "tr": "土耳其语",
+}
 
 
 @dataclass(frozen=True)
@@ -71,14 +95,21 @@ class Stream:
 class Result:
     source: Path
     answered: bool = False
+    direct_wav: bool = False
+    channel: str = ""
     wav: Path | None = None
     stream_count: int = 0
     packet_count: int = 0
     duration: float = 0.0
     note: str = ""
     transcript: str = ""
+    detected_language: str = ""
+    language_probability: float = 0.0
+    translated_text: str = ""
+    translation_language: str = ""
     prompt_category: str = ""
     asr_note: str = ""
+    translation_note: str = ""
 
 
 @dataclass
@@ -94,8 +125,19 @@ class PromptGroup:
     variants: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class Recognition:
+    text: str
+    language: str
+    language_probability: float
+
+
+def join_segment_texts(segments: Iterable[object]) -> str:
+    return "".join(getattr(segment, "text", "") for segment in segments).strip()
+
+
 class FasterWhisperRecognizer:
-    def __init__(self, model: str, model_dir: Path | None = None):
+    def __init__(self, model: str, model_dir: Path | None = None, language: str = "auto"):
         try:
             from faster_whisper import WhisperModel
         except (ImportError, OSError) as error:
@@ -109,16 +151,91 @@ class FasterWhisperRecognizer:
             )
         except Exception as error:
             raise AsrError(f"ASR 模型加载失败：{error}") from error
+        self._language = None if language == "auto" else language
 
-    def transcribe(self, wav_path: Path) -> str:
-        segments, _info = self._model.transcribe(
+    def _transcribe(self, wav_path: Path, task: str, language: str | None) -> tuple[str, object]:
+        segments, info = self._model.transcribe(
             str(wav_path),
-            language="zh",
+            language=language,
+            task=task,
             beam_size=5,
             vad_filter=True,
             condition_on_previous_text=False,
         )
-        return "".join(segment.text.strip() for segment in segments).strip()
+        text = join_segment_texts(segments)
+        return text, info
+
+    def transcribe(self, wav_path: Path) -> Recognition:
+        text, info = self._transcribe(wav_path, "transcribe", self._language)
+        return Recognition(
+            text=text,
+            language=getattr(info, "language", None) or self._language or "",
+            language_probability=float(getattr(info, "language_probability", 0.0) or 0.0),
+        )
+
+    def translate_to_english(self, wav_path: Path, source_language: str) -> str:
+        text, _info = self._transcribe(wav_path, "translate", source_language or None)
+        return text
+
+
+class ArgosEnglishTranslator:
+    def __init__(self, target_language: str):
+        try:
+            from argostranslate import package, translate
+        except (ImportError, OSError) as error:
+            raise TranslationError(f"无法加载 argostranslate：{error}") from error
+        self._package = package
+        self._translate = translate
+        self._target_language = target_language
+        self._translation = self._find_installed_translation()
+        self._initialization_error: TranslationError | None = None
+
+    def _find_installed_translation(self):
+        languages = {language.code: language for language in self._translate.get_installed_languages()}
+        if "en" not in languages or self._target_language not in languages:
+            return None
+        try:
+            return languages["en"].get_translation(languages[self._target_language])
+        except Exception:
+            return None
+
+    def _download_translation(self):
+        try:
+            self._package.update_package_index()
+            packages = self._package.get_available_packages()
+            selected = next(
+                (
+                    item
+                    for item in packages
+                    if item.from_code == "en" and item.to_code == self._target_language
+                ),
+                None,
+            )
+            if selected is None:
+                raise TranslationError(f"未找到英语到 {self._target_language} 的 Argos 翻译模型包")
+            self._package.install_from_path(selected.download())
+            translation = self._find_installed_translation()
+            if translation is None:
+                raise TranslationError(f"英语到 {self._target_language} 的 Argos 翻译模型安装后不可用")
+            return translation
+        except TranslationError:
+            raise
+        except Exception as error:
+            raise TranslationError(f"翻译模型下载或安装失败：{error}") from error
+
+    def translate(self, text: str) -> str:
+        try:
+            if self._initialization_error is not None:
+                raise self._initialization_error
+            if self._translation is None:
+                try:
+                    self._translation = self._download_translation()
+                except TranslationError as error:
+                    self._initialization_error = error
+                    raise
+            return self._translation.translate(text).strip()
+        except Exception as error:
+            raise TranslationError(f"英语到 {self._target_language} 翻译失败：{error}") from error
 
 
 def iter_capture(path: Path, status: CaptureStatus | None = None) -> Iterator[tuple[float, int, bytes]]:
@@ -497,8 +614,9 @@ def render_stream(stream: Stream, global_start: float, rate: int = 8000) -> tupl
     return start, output
 
 
-def mix_streams(streams: list[Stream]) -> array[int]:
-    global_start = min(packet.time for stream in streams for packet in stream.packets)
+def mix_streams(streams: list[Stream], global_start: float | None = None) -> array[int]:
+    if global_start is None:
+        global_start = min(packet.time for stream in streams for packet in stream.packets)
     rendered = [render_stream(stream, global_start) for stream in streams]
     length = max(start + len(samples) for start, samples in rendered)
     sums = array("i", [0]) * length
@@ -537,12 +655,94 @@ def write_wav(path: Path, samples: array[int], rate: int = 8000) -> None:
             output.writeframesraw(chunk.tobytes())
 
 
+def write_stereo_wav(path: Path, left: array[int], right: array[int], rate: int = 8000) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    length = max(len(left), len(right))
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(rate)
+        chunk_size = 100_000
+        for start in range(0, length, chunk_size):
+            frames = array("h")
+            for index in range(start, min(length, start + chunk_size)):
+                frames.append(left[index] if index < len(left) else 0)
+                frames.append(right[index] if index < len(right) else 0)
+            if sys.byteorder != "little":
+                frames.byteswap()
+            output.writeframesraw(frames.tobytes())
+
+
+def group_streams_by_direction(streams: list[Stream]) -> list[list[Stream]]:
+    grouped: dict[tuple[str, int, str, int], list[Stream]] = {}
+    for stream in streams:
+        grouped.setdefault(stream.key[:4], []).append(stream)
+    return sorted(
+        grouped.values(),
+        key=lambda group: min(packet.time for stream in group for packet in stream.packets),
+    )
+
+
+def prepare_direct_wav(source: Path, output: Path, channel_mode: str) -> list[Result]:
+    if channel_mode == "mixed":
+        return [Result(source, direct_wav=True, channel="混合", wav=source, note="直接识别 WAV")]
+    try:
+        with wave.open(str(source), "rb") as input_wav:
+            channel_count = input_wav.getnchannels()
+            sample_width = input_wav.getsampwidth()
+            frame_rate = input_wav.getframerate()
+            frame_count = input_wav.getnframes()
+            compression = input_wav.getcomptype()
+            frames = input_wav.readframes(frame_count)
+    except (OSError, EOFError, wave.Error) as error:
+        raise AsrError(f"无法读取 WAV 声道：{error}") from error
+    if channel_count == 1:
+        duration = frame_count / frame_rate if frame_rate else 0.0
+        return [Result(
+            source,
+            direct_wav=True,
+            channel="单声道",
+            wav=source,
+            duration=duration,
+            note="直接识别 WAV",
+        )]
+    if channel_count != 2 or compression != "NONE":
+        return [Result(source, direct_wav=True, channel="混合", wav=source, note="非 PCM 双声道 WAV，已回退混合识别")]
+    frame_size = channel_count * sample_width
+    channel_data = [bytearray(), bytearray()]
+    for offset in range(0, len(frames), frame_size):
+        frame = frames[offset : offset + frame_size]
+        if len(frame) < frame_size:
+            break
+        channel_data[0].extend(frame[:sample_width])
+        channel_data[1].extend(frame[sample_width:])
+    results: list[Result] = []
+    duration = frame_count / frame_rate if frame_rate else 0.0
+    for label, data in zip(("左声道", "右声道"), channel_data):
+        channel_path = output / "直接WAV" / "声道" / f"{source.stem}_{label}.wav"
+        channel_path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(channel_path), "wb") as output_wav:
+            output_wav.setnchannels(1)
+            output_wav.setsampwidth(sample_width)
+            output_wav.setframerate(frame_rate)
+            output_wav.writeframes(bytes(data))
+        results.append(Result(
+            source,
+            direct_wav=True,
+            channel=label,
+            wav=channel_path,
+            duration=duration,
+            note="双声道 WAV 已拆分识别",
+        ))
+    return results
+
+
 def find_captures(root: Path, recursive: bool) -> list[Path]:
     iterator = root.rglob("*") if recursive else root.glob("*")
     return sorted(path for path in iterator if path.is_file() and path.suffix.lower() in PCAP_EXTENSIONS)
 
 
-def process_file(source: Path, output: Path, status_filter: str) -> Result:
+def process_capture(source: Path, output: Path, status_filter: str, channel_mode: str) -> list[Result]:
     result = Result(source)
     try:
         capture_status = CaptureStatus()
@@ -553,32 +753,79 @@ def process_file(source: Path, output: Path, status_filter: str) -> Result:
         result.packet_count = packet_count
         if status_filter == "answered" and not answered or status_filter == "unanswered" and answered:
             result.note = "已按接通状态跳过" + warning
-            return result
+            return [result]
         if not streams:
             known = sorted(payload_types)
             result.note = "未发现可导出的 G.711 RTP 媒体流"
             if known:
                 result.note += f"（检测到 RTP Payload Type: {known}）"
             result.note += warning
-            return result
+            return [result]
+        category = "已接通" if answered else "未接通"
+        direction_groups = group_streams_by_direction(streams)
+        if channel_mode == "separate" and len(direction_groups) == 2:
+            global_start = min(packet.time for stream in streams for packet in stream.packets)
+            channel_samples = [mix_streams(group, global_start) for group in direction_groups]
+            if not all(channel_samples):
+                result.note = "媒体流没有有效音频样本" + warning
+                return [result]
+            stereo_path = output / category / f"{source.stem}.wav"
+            write_stereo_wav(stereo_path, channel_samples[0], channel_samples[1])
+            channel_results: list[Result] = []
+            for label, group, samples in zip(("左声道", "右声道"), direction_groups, channel_samples):
+                channel_path = output / category / "声道" / f"{source.stem}_{label}.wav"
+                write_wav(channel_path, samples)
+                channel_results.append(Result(
+                    source=source,
+                    answered=answered,
+                    channel=label,
+                    wav=channel_path,
+                    stream_count=len(group),
+                    packet_count=sum(len(stream.packets) for stream in group),
+                    duration=len(samples) / 8000,
+                    note=f"声道导出成功；双声道文件：{stereo_path}{warning}",
+                ))
+            return channel_results
         samples = mix_streams(streams)
         if not samples:
             result.note = "媒体流没有有效音频样本" + warning
-            return result
-        category = "已接通" if answered else "未接通"
+            return [result]
         target = output / category / f"{source.stem}.wav"
         write_wav(target, samples)
+        result.channel = "混合" if len(direction_groups) > 1 else "单声道"
         result.wav = target
         result.duration = len(samples) / 8000
-        result.note = "导出成功" + warning
+        fallback = "（检测到超过两个 RTP 方向，已回退混合模式）" if channel_mode == "separate" and len(direction_groups) > 2 else ""
+        result.note = "导出成功" + fallback + warning
     except (OSError, CaptureError, struct.error, ValueError) as error:
         result.note = f"处理失败：{error}"
-    return result
+    return [result]
 
 
-def transcribe_unanswered(results: list[Result], recognizer) -> None:
+def process_file(source: Path, output: Path, status_filter: str) -> Result:
+    return process_capture(source, output, status_filter, "mixed")[0]
+
+
+def matches_asr_status(result: Result, asr_status: str) -> bool:
+    return result.direct_wav or asr_status == "all" or (asr_status == "answered") == result.answered
+
+
+def result_status(result: Result) -> str:
+    if result.direct_wav:
+        return "直接WAV"
+    return "已接通" if result.answered else "未接通"
+
+
+def transcribe_results(
+    results: list[Result],
+    recognizer,
+    asr_status: str = "unanswered",
+    translator=None,
+    target_language: str | None = None,
+    translation_error: str = "",
+) -> None:
     for result in results:
-        if result.answered:
+        if not matches_asr_status(result, asr_status):
             continue
         if result.wav is None:
             result.asr_note = "无可识别录音"
@@ -586,10 +833,50 @@ def transcribe_unanswered(results: list[Result], recognizer) -> None:
         if recognizer is None:
             continue
         try:
-            result.transcript = recognizer.transcribe(result.wav)
+            recognition = recognizer.transcribe(result.wav)
+            if isinstance(recognition, str):
+                result.transcript = recognition
+            else:
+                result.transcript = recognition.text
+                result.detected_language = recognition.language
+                result.language_probability = recognition.language_probability
             result.asr_note = "识别成功" if result.transcript else "未识别到语音"
         except Exception as error:
             result.asr_note = f"识别失败：{error}"
+            continue
+        if target_language is None or not result.transcript:
+            continue
+        result.translation_language = target_language
+        if result.detected_language == target_language:
+            result.translated_text = result.transcript
+            result.translation_note = "原文已是目标语言，无需翻译"
+            continue
+        try:
+            english_text = result.transcript
+            if result.detected_language != "en":
+                english_text = recognizer.translate_to_english(result.wav, result.detected_language)
+            if target_language == "en":
+                result.translated_text = english_text
+            else:
+                if translation_error:
+                    raise TranslationError(translation_error)
+                if translator is None:
+                    raise TranslationError("本地翻译引擎不可用")
+                result.translated_text = translator.translate(english_text)
+            result.translation_note = "翻译成功" if result.translated_text else "未生成翻译文本"
+        except Exception as error:
+            result.translation_note = f"翻译失败：{error}"
+
+
+def language_label(code: str) -> str:
+    if not code:
+        return ""
+    name = WHISPER_LANGUAGE_NAMES_ZH.get(code)
+    return f"{name} ({code})" if name else code
+
+
+def classification_text(result: Result) -> str:
+    return result.translated_text or result.transcript
 
 
 def normalize_transcript(text: str) -> str:
@@ -609,7 +896,7 @@ def transcript_similarity(left: str, right: str) -> float:
 def classify_transcripts(results: list[Result], threshold: float = 0.82) -> list[PromptGroup]:
     variants: dict[str, list[Result]] = {}
     for result in results:
-        normalized = normalize_transcript(result.transcript)
+        normalized = normalize_transcript(classification_text(result))
         if normalized:
             variants.setdefault(normalized, []).append(result)
     texts = sorted(variants)
@@ -637,7 +924,7 @@ def classify_transcripts(results: list[Result], threshold: float = 0.82) -> list
 
     prepared: list[tuple[str, list[Result], tuple[str, ...]]] = []
     for members in clusters.values():
-        counts = Counter(item.transcript.strip() for item in members)
+        counts = Counter(classification_text(item).strip() for item in members)
         representative = min(counts, key=lambda value: (-counts[value], len(value), value))
         ordered_variants = tuple(sorted(counts, key=lambda value: (-counts[value], value)))
         prepared.append((representative, members, ordered_variants))
@@ -657,18 +944,41 @@ def write_report(output: Path, results: list[Result]) -> Path:
     path = output / "导出报告.csv"
     with path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["抓包文件", "接通状态", "WAV文件", "RTP流数", "RTP包数", "时长秒", "提示音内容", "提示音分类", "ASR结果", "结果"])
+        writer.writerow([
+            "抓包文件",
+            "接通状态",
+            "声道",
+            "WAV文件",
+            "RTP流数",
+            "RTP包数",
+            "时长秒",
+            "检测语言",
+            "语言置信度",
+            "识别原文",
+            "翻译目标语言",
+            "翻译文本",
+            "提示音分类",
+            "ASR结果",
+            "翻译结果",
+            "结果",
+        ])
         for item in results:
             writer.writerow([
                 str(item.source),
-                "已接通" if item.answered else "未接通",
+                result_status(item),
+                item.channel,
                 str(item.wav or ""),
                 item.stream_count,
                 item.packet_count,
                 f"{item.duration:.3f}" if item.duration else "",
+                language_label(item.detected_language),
+                f"{item.language_probability:.2%}" if item.detected_language else "",
                 item.transcript,
+                language_label(item.translation_language),
+                item.translated_text,
                 item.prompt_category,
                 item.asr_note,
+                item.translation_note,
                 item.note,
             ])
     return path
@@ -695,9 +1005,16 @@ def similarity_threshold(value: str) -> float:
     return threshold
 
 
+def translation_language(value: str) -> str:
+    code = value.strip().lower()
+    if not re.fullmatch(r"[a-z]{2,3}", code):
+        raise argparse.ArgumentTypeError("翻译目标语言必须是 zh、en、es 等两位或三位语言代码")
+    return code
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="批量识别 SIP 接通状态并将 G.711 RTP 媒体导出为 WAV")
-    parser.add_argument("input", type=Path, help="抓包目录，或单个 pcap/pcapng 文件")
+    parser = argparse.ArgumentParser(description="导出 SIP/RTP 录音，或直接识别单个 WAV 文件")
+    parser.add_argument("input", type=Path, help="抓包目录、单个 pcap/pcapng/cap 文件，或单个 WAV 文件")
     parser.add_argument("-o", "--output", type=Path, default=Path("wav_output"), help="输出目录（默认：wav_output）")
     parser.add_argument(
         "--status",
@@ -706,9 +1023,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="all=全部，answered=仅接通，unanswered=仅未接通（默认：all）",
     )
     parser.add_argument("--no-recursive", action="store_true", help="不扫描输入目录的子目录")
-    parser.add_argument("--asr", action="store_true", help="对未接通 WAV 执行中文 ASR 识别")
+    parser.add_argument(
+        "--channel-mode",
+        choices=("separate", "mixed"),
+        default="separate",
+        help="separate=左右声道分别处理，mixed=混合处理（默认：separate）",
+    )
+    parser.add_argument("--asr", action="store_true", help="对指定范围的 WAV 执行 ASR 识别")
+    parser.add_argument(
+        "--asr-status",
+        choices=("all", "answered", "unanswered"),
+        default="unanswered",
+        help="all=全部，answered=仅接通，unanswered=仅未接通（默认：unanswered）",
+    )
     parser.add_argument("--asr-model", default="small", help="faster-whisper 模型名称或本地模型目录（默认：small）")
     parser.add_argument("--asr-model-dir", type=Path, help="模型下载和缓存目录")
+    parser.add_argument("--asr-language", default="auto", help="识别语言代码，auto=自动检测（默认：auto）")
+    parser.add_argument(
+        "--translate-language",
+        type=translation_language,
+        default="zh",
+        help="翻译目标语言代码（默认：zh，即中文）",
+    )
+    parser.add_argument("--no-translate", action="store_true", help="只保留识别原文，不执行翻译")
     parser.add_argument("--asr-similarity", type=similarity_threshold, default=0.82, help="提示音文本聚类阈值 0-1（默认：0.82）")
     return parser
 
@@ -720,41 +1057,82 @@ def main(argv: list[str] | None = None) -> int:
     if not source.exists():
         print(f"错误：输入路径不存在：{source}", file=sys.stderr)
         return 2
-    captures = [source] if source.is_file() else find_captures(source, not args.no_recursive)
-    if not captures:
-        print("没有找到 .pcap、.pcapng 或 .cap 文件。", file=sys.stderr)
-        return 1
-    results: list[Result] = []
-    for index, capture in enumerate(captures, 1):
-        result = process_file(capture, output, args.status)
-        results.append(result)
-        state = "已接通" if result.answered else "未接通"
-        print(f"[{index}/{len(captures)}] {capture.name} | {state} | {result.note}")
+    direct_wav = source.is_file() and source.suffix.lower() == ".wav"
+    if direct_wav:
+        if not args.asr:
+            print("错误：直接输入 WAV 文件时必须指定 --asr。", file=sys.stderr)
+            return 2
+        try:
+            results = prepare_direct_wav(source, output, args.channel_mode)
+        except AsrError as error:
+            print(f"错误：{error}", file=sys.stderr)
+            return 2
+        for item in results:
+            print(f"{source.name} | 直接WAV | {item.channel} | 等待识别")
+    else:
+        captures = [source] if source.is_file() else find_captures(source, not args.no_recursive)
+        if not captures:
+            print("没有找到 .pcap、.pcapng 或 .cap 文件。", file=sys.stderr)
+            return 1
+        results = []
+        for index, capture in enumerate(captures, 1):
+            capture_results = process_capture(capture, output, args.status, args.channel_mode)
+            results.extend(capture_results)
+            for result in capture_results:
+                channel = f" | {result.channel}" if result.channel else ""
+                print(f"[{index}/{len(captures)}] {capture.name} | {result_status(result)}{channel} | {result.note}")
     if args.asr:
-        candidates = [item for item in results if not item.answered and item.wav is not None]
+        candidates = [
+            item
+            for item in results
+            if matches_asr_status(item, args.asr_status) and item.wav is not None
+        ]
         if candidates:
             print(f"正在加载 ASR 模型：{args.asr_model}")
             try:
-                recognizer = FasterWhisperRecognizer(args.asr_model, args.asr_model_dir)
+                recognizer = FasterWhisperRecognizer(args.asr_model, args.asr_model_dir, args.asr_language)
             except AsrError as error:
-                transcribe_unanswered(results, None)
+                transcribe_results(results, None, args.asr_status)
                 for item in candidates:
                     item.asr_note = f"识别失败：{error}"
             else:
-                transcribe_unanswered(results, recognizer)
+                translator = None
+                translation_error = ""
+                target_language = None if args.no_translate else args.translate_language
+                if target_language not in (None, "en"):
+                    try:
+                        translator = ArgosEnglishTranslator(target_language)
+                    except TranslationError as error:
+                        translation_error = str(error)
+                transcribe_results(
+                    results,
+                    recognizer,
+                    args.asr_status,
+                    translator,
+                    target_language,
+                    translation_error,
+                )
                 for index, item in enumerate(candidates, 1):
-                    print(f"[ASR {index}/{len(candidates)}] {item.wav.name} | {item.asr_note} | {item.transcript}")
+                    language = language_label(item.detected_language) or "未知语言"
+                    target = language_label(item.translation_language) or item.translation_language
+                    translation = f" | {target}：{item.translated_text}" if item.translated_text else ""
+                    print(f"[ASR {index}/{len(candidates)}] {item.wav.name} | {language} | {item.asr_note} | {item.transcript}{translation}")
         else:
-            transcribe_unanswered(results, None)
+            transcribe_results(results, None, args.asr_status)
     groups = classify_transcripts(results, args.asr_similarity) if args.asr else []
     category_report = write_category_report(output, groups) if args.asr else None
     report = write_report(output, results)
     exported = sum(item.wav is not None for item in results)
     failed = sum(item.note.startswith("处理失败") for item in results)
     asr_failed = sum(item.asr_note.startswith("识别失败") for item in results)
+    translation_failed = sum(item.translation_note.startswith("翻译失败") for item in results)
     category_message = f"，提示音分类 {len(groups)} 个；分类汇总：{category_report}" if category_report else ""
-    print(f"完成：导出 {exported} 个 WAV，抓包失败 {failed} 个，ASR失败 {asr_failed} 个{category_message}；报告：{report}")
-    return 2 if failed or asr_failed else 0
+    translation_message = f"，翻译失败 {translation_failed} 个" if not args.no_translate else ""
+    if direct_wav:
+        print(f"完成：识别 {len(results)} 个声道，ASR失败 {asr_failed} 个{translation_message}{category_message}；报告：{report}")
+    else:
+        print(f"完成：导出 {exported} 个 WAV，抓包失败 {failed} 个，ASR失败 {asr_failed} 个{translation_message}{category_message}；报告：{report}")
+    return 2 if failed or asr_failed or translation_failed else 0
 
 
 if __name__ == "__main__":

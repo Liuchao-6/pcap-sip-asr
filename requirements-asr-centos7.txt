@@ -4,3 +4,4 @@ ctranslate2==4.6.0
 onnxruntime==1.16.3
 av==13.1.0
 numpy<2
+argostranslate==1.9.6

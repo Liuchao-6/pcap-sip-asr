@@ -5,6 +5,8 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import pcapsip2wav as tool
 
@@ -96,9 +98,39 @@ class ToolTests(unittest.TestCase):
             with report.open(encoding="utf-8-sig", newline="") as source:
                 rows = list(csv.reader(source))
             self.assertEqual(rows[1][1], "已接通")
-            self.assertEqual(rows[0][-4:], ["提示音内容", "提示音分类", "ASR结果", "结果"])
+            self.assertEqual(
+                rows[0][-9:],
+                ["检测语言", "语言置信度", "识别原文", "翻译目标语言", "翻译文本", "提示音分类", "ASR结果", "翻译结果", "结果"],
+            )
 
-    def test_asr_only_transcribes_unanswered_wav(self):
+    def test_two_rtp_directions_export_stereo_and_channel_wavs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "answered.pcap"
+            sip = b"SIP/2.0 200 OK\r\nCSeq: 1 INVITE\r\n\r\n"
+            frames = [(1.0, udp_frame(sip, 5060, 5060))]
+            for index in range(3):
+                frames.append((1.1 + index * 0.02, udp_frame(rtp(8, index, index * 160, 11, b"\xd5" * 160), 10000, 20000)))
+                frames.append((1.11 + index * 0.02, udp_frame(
+                    rtp(8, index, index * 160, 22, b"\x55" * 160),
+                    20000,
+                    10000,
+                    src="10.0.0.2",
+                    dst="10.0.0.1",
+                )))
+            write_pcap(capture, frames)
+
+            results = tool.process_capture(capture, root / "out", "all", "separate")
+
+            self.assertEqual([item.channel for item in results], ["左声道", "右声道"])
+            self.assertTrue(all(item.wav.is_file() for item in results))
+            with wave.open(str(root / "out" / "已接通" / "answered.wav"), "rb") as stereo:
+                self.assertEqual(stereo.getnchannels(), 2)
+            for item in results:
+                with wave.open(str(item.wav), "rb") as mono:
+                    self.assertEqual(mono.getnchannels(), 1)
+
+    def test_asr_defaults_to_unanswered_wav(self):
         class Recognizer:
             def __init__(self):
                 self.paths = []
@@ -112,13 +144,176 @@ class ToolTests(unittest.TestCase):
         no_audio = tool.Result(Path("no-audio.pcap"))
         recognizer = Recognizer()
 
-        tool.transcribe_unanswered([unanswered, answered, no_audio], recognizer)
+        tool.transcribe_results([unanswered, answered, no_audio], recognizer)
 
         self.assertEqual(recognizer.paths, [Path("unanswered.wav")])
         self.assertEqual(unanswered.transcript, "您拨打的号码暂时无法接通")
         self.assertEqual(unanswered.asr_note, "识别成功")
         self.assertEqual(answered.asr_note, "")
         self.assertEqual(no_audio.asr_note, "无可识别录音")
+
+    def test_asr_can_transcribe_answered_or_all_wav(self):
+        class Recognizer:
+            def __init__(self):
+                self.paths = []
+
+            def transcribe(self, path):
+                self.paths.append(path)
+                return path.stem
+
+        unanswered = tool.Result(Path("unanswered.pcap"), wav=Path("unanswered.wav"))
+        answered = tool.Result(Path("answered.pcap"), answered=True, wav=Path("answered.wav"))
+        recognizer = Recognizer()
+
+        tool.transcribe_results([unanswered, answered], recognizer, "answered")
+
+        self.assertEqual(recognizer.paths, [Path("answered.wav")])
+        self.assertEqual(answered.transcript, "answered")
+        self.assertEqual(unanswered.transcript, "")
+
+        recognizer = Recognizer()
+        tool.transcribe_results([unanswered, answered], recognizer, "all")
+        self.assertEqual(recognizer.paths, [Path("unanswered.wav"), Path("answered.wav")])
+
+    def test_asr_status_parser_defaults_to_unanswered(self):
+        parser = tool.build_parser()
+
+        defaults = parser.parse_args(["capture.pcap"])
+        answered = parser.parse_args(["capture.pcap", "--asr-status", "answered"])
+        spanish = parser.parse_args(["capture.pcap", "--translate-language", "ES"])
+
+        self.assertEqual(defaults.asr_status, "unanswered")
+        self.assertEqual(defaults.asr_language, "auto")
+        self.assertEqual(defaults.channel_mode, "separate")
+        self.assertEqual(defaults.translate_language, "zh")
+        self.assertFalse(defaults.no_translate)
+        self.assertEqual(answered.asr_status, "answered")
+        self.assertEqual(spanish.translate_language, "es")
+
+    def test_foreign_asr_detects_language_and_translates_to_chinese(self):
+        class Recognizer:
+            def transcribe(self, _path):
+                return tool.Recognition("El numero no esta disponible", "es", 0.985)
+
+            def translate_to_english(self, _path, language):
+                self.language = language
+                return "The number is unavailable"
+
+        class Translator:
+            def translate(self, text):
+                self.text = text
+                return "该号码暂时无法接通"
+
+        result = tool.Result(Path("spanish.wav"), direct_wav=True, wav=Path("spanish.wav"))
+        recognizer = Recognizer()
+        translator = Translator()
+
+        tool.transcribe_results([result], recognizer, translator=translator, target_language="zh")
+
+        self.assertEqual(result.detected_language, "es")
+        self.assertEqual(result.language_probability, 0.985)
+        self.assertEqual(recognizer.language, "es")
+        self.assertEqual(translator.text, "The number is unavailable")
+        self.assertEqual(result.translation_language, "zh")
+        self.assertEqual(result.translated_text, "该号码暂时无法接通")
+        self.assertEqual(result.translation_note, "翻译成功")
+
+    def test_foreign_asr_preserves_spaces_between_segments(self):
+        segments = [SimpleNamespace(text=" Hola"), SimpleNamespace(text=" mundo"), SimpleNamespace(text=".")]
+
+        self.assertEqual(tool.join_segment_texts(segments), "Hola mundo.")
+
+    def test_chinese_asr_does_not_call_translator(self):
+        class Recognizer:
+            def transcribe(self, _path):
+                return tool.Recognition("您拨打的号码无法接通", "zh", 0.99)
+
+        class Translator:
+            def translate(self, _text):
+                raise AssertionError("中文不应再次翻译")
+
+        result = tool.Result(Path("chinese.wav"), direct_wav=True, wav=Path("chinese.wav"))
+
+        tool.transcribe_results([result], Recognizer(), translator=Translator(), target_language="zh")
+
+        self.assertEqual(result.translated_text, result.transcript)
+        self.assertEqual(result.translation_note, "原文已是目标语言，无需翻译")
+
+    def test_translation_target_can_be_changed(self):
+        class Recognizer:
+            def transcribe(self, _path):
+                return tool.Recognition("The line is busy", "en", 0.99)
+
+        class Translator:
+            def translate(self, text):
+                self.text = text
+                return "La linea esta ocupada"
+
+        result = tool.Result(Path("english.wav"), direct_wav=True, wav=Path("english.wav"))
+        translator = Translator()
+
+        tool.transcribe_results([result], Recognizer(), translator=translator, target_language="es")
+
+        self.assertEqual(translator.text, "The line is busy")
+        self.assertEqual(result.translation_language, "es")
+        self.assertEqual(result.translated_text, "La linea esta ocupada")
+
+    def test_direct_wav_is_transcribed_and_reported(self):
+        class Recognizer:
+            def __init__(self, _model, _model_dir, _language):
+                pass
+
+            def transcribe(self, path):
+                self.path = path
+                return tool.Recognition("这是指定 WAV 的识别内容", "zh", 0.97)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wav_path = root / "call.wav"
+            with wave.open(str(wav_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(8000)
+                wav_file.writeframes(b"\x00\x00" * 160)
+            output = root / "out"
+
+            with mock.patch.object(tool, "FasterWhisperRecognizer", Recognizer):
+                exit_code = tool.main([str(wav_path), "-o", str(output), "--asr"])
+
+            self.assertEqual(exit_code, 0)
+            with (output / "导出报告.csv").open(encoding="utf-8-sig", newline="") as source:
+                rows = list(csv.reader(source))
+            self.assertEqual(rows[1][0], str(wav_path))
+            self.assertEqual(rows[1][1], "直接WAV")
+            self.assertEqual(rows[1][2], "单声道")
+            self.assertEqual(rows[1][7], "中文 (zh)")
+            self.assertEqual(rows[1][8], "97.00%")
+            self.assertEqual(rows[1][9], "这是指定 WAV 的识别内容")
+            self.assertTrue((output / "提示音分类汇总.csv").is_file())
+
+    def test_direct_stereo_wav_is_split_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wav_path = root / "stereo.wav"
+            frames = b"".join(struct.pack("<hh", left, right) for left, right in [(100, -100), (200, -200)])
+            with wave.open(str(wav_path), "wb") as wav_file:
+                wav_file.setnchannels(2)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(8000)
+                wav_file.writeframes(frames)
+
+            results = tool.prepare_direct_wav(wav_path, root / "out", "separate")
+
+            self.assertEqual([item.channel for item in results], ["左声道", "右声道"])
+            with wave.open(str(results[0].wav), "rb") as left:
+                self.assertEqual(left.readframes(2), struct.pack("<hh", 100, 200))
+            with wave.open(str(results[1].wav), "rb") as right:
+                self.assertEqual(right.readframes(2), struct.pack("<hh", -100, -200))
+
+            mixed = tool.prepare_direct_wav(wav_path, root / "out", "mixed")
+            self.assertEqual(len(mixed), 1)
+            self.assertEqual(mixed[0].channel, "混合")
+            self.assertEqual(mixed[0].wav, wav_path)
 
     def test_asr_failure_does_not_stop_other_results(self):
         class Recognizer:
@@ -127,7 +322,7 @@ class ToolTests(unittest.TestCase):
 
         result = tool.Result(Path("unanswered.pcap"), wav=Path("unanswered.wav"))
 
-        tool.transcribe_unanswered([result], Recognizer())
+        tool.transcribe_results([result], Recognizer())
 
         self.assertEqual(result.asr_note, "识别失败：bad audio")
 
@@ -147,6 +342,17 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(results[1].prompt_category, "提示音-001")
         self.assertEqual(results[2].prompt_category, "提示音-001")
         self.assertEqual(results[3].prompt_category, "提示音-002")
+
+    def test_chinese_translation_is_used_for_classification(self):
+        results = [
+            tool.Result(Path("es.wav"), transcript="Numero ocupado", translated_text="线路忙，请稍后再拨"),
+            tool.Result(Path("en.wav"), transcript="Line busy", translated_text="线路忙请稍后再拨"),
+        ]
+
+        groups = tool.classify_transcripts(results)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].count, 2)
 
     def test_transcript_normalization_ignores_punctuation_and_number_values(self):
         left = tool.normalize_transcript("号码 138-0013-8000 暂停服务！")
