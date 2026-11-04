@@ -124,6 +124,8 @@ class ToolTests(unittest.TestCase):
 
             self.assertEqual([item.channel for item in results], ["左声道", "右声道"])
             self.assertTrue(all(item.wav.is_file() for item in results))
+            self.assertTrue(all(item.quality is not None for item in results))
+            self.assertTrue(all(not item.quality.suspected_stutter for item in results))
             with wave.open(str(root / "out" / "已接通" / "answered.wav"), "rb") as stereo:
                 self.assertEqual(stereo.getnchannels(), 2)
             for item in results:
@@ -283,12 +285,14 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             with (output / "导出报告.csv").open(encoding="utf-8-sig", newline="") as source:
                 rows = list(csv.reader(source))
-            self.assertEqual(rows[1][0], str(wav_path))
-            self.assertEqual(rows[1][1], "直接WAV")
-            self.assertEqual(rows[1][2], "单声道")
-            self.assertEqual(rows[1][7], "中文 (zh)")
-            self.assertEqual(rows[1][8], "97.00%")
-            self.assertEqual(rows[1][9], "这是指定 WAV 的识别内容")
+            report_row = dict(zip(rows[0], rows[1]))
+            self.assertEqual(report_row["抓包文件"], str(wav_path))
+            self.assertEqual(report_row["接通状态"], "直接WAV")
+            self.assertEqual(report_row["声道"], "单声道")
+            self.assertEqual(report_row["疑似卡顿"], "无法判断（无RTP）")
+            self.assertEqual(report_row["检测语言"], "中文 (zh)")
+            self.assertEqual(report_row["语言置信度"], "97.00%")
+            self.assertEqual(report_row["识别原文"], "这是指定 WAV 的识别内容")
             self.assertTrue((output / "提示音分类汇总.csv").is_file())
 
     def test_direct_stereo_wav_is_split_by_default(self):
@@ -359,6 +363,100 @@ class ToolTests(unittest.TestCase):
         right = tool.normalize_transcript("号码13900139000暂停服务")
 
         self.assertEqual(left, right)
+
+    def test_rtp_quality_detects_continuous_packet_loss(self):
+        packets = [
+            tool.RtpPacket(1.00, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 1, 0, 7, b"\xd5" * 160),
+            tool.RtpPacket(1.02, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 2, 160, 7, b"\xd5" * 160),
+            tool.RtpPacket(1.08, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 5, 640, 7, b"\xd5" * 160),
+        ]
+        stream = tool.Stream(("10.0.0.1", 10000, "10.0.0.2", 20000, 7), 8, packets)
+
+        quality = tool.analyze_stream_quality(stream)
+
+        self.assertEqual(quality.received_packets, 3)
+        self.assertEqual(quality.lost_packets, 2)
+        self.assertEqual(quality.loss_events, 1)
+        self.assertAlmostEqual(quality.longest_gap_ms, 40.0)
+        self.assertTrue(quality.suspected_stutter)
+        self.assertTrue(any("最长连续缺口" in reason for reason in quality.reasons))
+
+    def test_rtp_quality_normal_stream_is_not_suspected(self):
+        packets = [
+            tool.RtpPacket(1.00 + index * 0.02, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, index, index * 160, 7, b"\xd5" * 160)
+            for index in range(20)
+        ]
+        stream = tool.Stream(("10.0.0.1", 10000, "10.0.0.2", 20000, 7), 8, packets)
+
+        quality = tool.analyze_stream_quality(stream)
+
+        self.assertEqual(quality.lost_packets, 0)
+        self.assertAlmostEqual(quality.jitter_ms, 0.0)
+        self.assertFalse(quality.suspected_stutter)
+
+    def test_rtp_quality_counts_reordered_and_duplicate_packets(self):
+        packets = [
+            tool.RtpPacket(1.00, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 1, 0, 7, b"\xd5" * 160),
+            tool.RtpPacket(1.02, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 3, 320, 7, b"\xd5" * 160),
+            tool.RtpPacket(1.04, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 2, 160, 7, b"\xd5" * 160),
+            tool.RtpPacket(1.05, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 2, 160, 7, b"\xd5" * 160),
+        ]
+        stream = tool.Stream(("10.0.0.1", 10000, "10.0.0.2", 20000, 7), 8, packets)
+
+        quality = tool.analyze_stream_quality(stream)
+
+        self.assertEqual(quality.lost_packets, 0)
+        self.assertEqual(quality.out_of_order_packets, 1)
+        self.assertEqual(quality.duplicate_packets, 1)
+
+    def test_sequence_gap_without_audio_timestamp_gap_is_not_loss(self):
+        packets = [
+            tool.RtpPacket(1.00, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 1, 0, 7, b"\xd5" * 160),
+            tool.RtpPacket(1.02, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 3, 160, 7, b"\xd5" * 160),
+            tool.RtpPacket(1.04, "10.0.0.1", "10.0.0.2", 10000, 20000, 8, 4, 320, 7, b"\xd5" * 160),
+        ]
+        stream = tool.Stream(("10.0.0.1", 10000, "10.0.0.2", 20000, 7), 8, packets)
+
+        quality = tool.analyze_stream_quality(stream)
+
+        self.assertEqual(quality.lost_packets, 0)
+        self.assertFalse(quality.suspected_stutter)
+
+    def test_report_contains_stutter_conclusion_and_evidence(self):
+        quality = tool.RtpQuality(10, 2, 1, 2 / 12, 40.0, 5.0, 0, 0, True, ("丢包率 16.67%", "最长连续缺口 40.0ms"))
+        result = tool.Result(Path("call.pcap"), channel="左声道", quality=quality)
+        with tempfile.TemporaryDirectory() as directory:
+            report = tool.write_report(Path(directory), [result])
+
+            with report.open(encoding="utf-8-sig", newline="") as source:
+                row = next(csv.DictReader(source))
+
+        self.assertEqual(row["疑似卡顿"], "是")
+        self.assertEqual(row["推测丢包数"], "2")
+        self.assertIn("最长连续缺口", row["卡顿依据"])
+
+    def test_main_reports_stutter_without_asr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "loss.pcap"
+            frames = []
+            for sequence, timestamp, capture_time in [(1, 0, 1.00), (2, 160, 1.02), (5, 640, 1.08)]:
+                frames.append((capture_time, udp_frame(
+                    rtp(8, sequence, timestamp, 7, b"\xd5" * 160),
+                    10000,
+                    20000,
+                )))
+            write_pcap(capture, frames)
+            output = root / "out"
+
+            exit_code = tool.main([str(capture), "-o", str(output), "--channel-mode", "mixed"])
+
+            self.assertEqual(exit_code, 0)
+            with (output / "导出报告.csv").open(encoding="utf-8-sig", newline="") as source:
+                row = next(csv.DictReader(source))
+            self.assertEqual(row["疑似卡顿"], "是")
+            self.assertEqual(row["推测丢包数"], "2")
+            self.assertEqual(row["ASR结果"], "")
 
     def test_category_report_contains_representative_and_count(self):
         with tempfile.TemporaryDirectory() as directory:

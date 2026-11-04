@@ -24,6 +24,9 @@ SIP_200_RE = re.compile(rb"(?im)^SIP/2\.0[ \t]+200(?:[ \t]|\r?$)")
 CSEQ_INVITE_RE = re.compile(rb"(?im)^CSeq\s*:\s*\d+\s+INVITE(?:\s|$)")
 PCAP_EXTENSIONS = {".pcap", ".pcapng", ".cap"}
 STATIC_CODECS = {0: ("PCMU", 8000), 8: ("PCMA", 8000)}
+STUTTER_LOSS_RATE_THRESHOLD = 0.01
+STUTTER_GAP_MS_THRESHOLD = 40.0
+STUTTER_JITTER_MS_THRESHOLD = 30.0
 
 
 class CaptureError(Exception):
@@ -91,6 +94,20 @@ class Stream:
     packets: list[RtpPacket] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class RtpQuality:
+    received_packets: int
+    lost_packets: int
+    loss_events: int
+    loss_rate: float
+    longest_gap_ms: float
+    jitter_ms: float
+    out_of_order_packets: int
+    duplicate_packets: int
+    suspected_stutter: bool
+    reasons: tuple[str, ...]
+
+
 @dataclass
 class Result:
     source: Path
@@ -100,7 +117,10 @@ class Result:
     wav: Path | None = None
     stream_count: int = 0
     packet_count: int = 0
+    rtp_direction: str = ""
+    codecs: str = ""
     duration: float = 0.0
+    quality: RtpQuality | None = None
     note: str = ""
     transcript: str = ""
     detected_language: str = ""
@@ -588,10 +608,116 @@ def _unwrap(value: int, base: int, bits: int) -> int:
     return delta - modulus if delta >= modulus // 2 else delta
 
 
+def _stutter_reasons(loss_rate: float, longest_gap_ms: float, jitter_ms: float) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if loss_rate >= STUTTER_LOSS_RATE_THRESHOLD:
+        reasons.append(f"丢包率 {loss_rate:.2%}")
+    if longest_gap_ms >= STUTTER_GAP_MS_THRESHOLD:
+        reasons.append(f"最长连续缺口 {longest_gap_ms:.1f}ms")
+    if jitter_ms >= STUTTER_JITTER_MS_THRESHOLD:
+        reasons.append(f"抖动 {jitter_ms:.1f}ms")
+    return tuple(reasons)
+
+
+def analyze_stream_quality(stream: Stream, rate: int = 8000) -> RtpQuality:
+    arrival_packets = sorted(stream.packets, key=lambda item: item.time)
+    unique_packets: list[RtpPacket] = []
+    seen: set[tuple[int, int]] = set()
+    duplicate_packets = 0
+    for packet in arrival_packets:
+        identity = (packet.sequence, packet.timestamp)
+        if identity in seen:
+            duplicate_packets += 1
+            continue
+        seen.add(identity)
+        unique_packets.append(packet)
+    if not unique_packets:
+        return RtpQuality(0, 0, 0, 0.0, 0.0, 0.0, 0, duplicate_packets, False, ())
+
+    base_timestamp = unique_packets[0].timestamp
+    highest_timestamp = 0
+    out_of_order_packets = 0
+    jitter_seconds = 0.0
+    previous_transit: float | None = None
+    for packet in unique_packets:
+        media_offset = _unwrap(packet.timestamp, base_timestamp, 32)
+        if media_offset < highest_timestamp:
+            out_of_order_packets += 1
+        else:
+            highest_timestamp = media_offset
+        transit = packet.time - media_offset / rate
+        if previous_transit is not None:
+            delta = abs(transit - previous_transit)
+            jitter_seconds += (delta - jitter_seconds) / 16
+        previous_transit = transit
+
+    media_packets = sorted(unique_packets, key=lambda item: _unwrap(item.timestamp, base_timestamp, 32))
+    payload_lengths = sorted(len(packet.payload) for packet in media_packets if packet.payload)
+    nominal_packet_samples = payload_lengths[len(payload_lengths) // 2] if payload_lengths else 1
+    lost_packets = 0
+    loss_events = 0
+    longest_gap_ms = 0.0
+    for previous, current in zip(media_packets, media_packets[1:]):
+        sequence_delta = (current.sequence - previous.sequence) & 0xFFFF
+        timestamp_delta = _unwrap(current.timestamp, previous.timestamp, 32)
+        if not 1 < sequence_delta < 0x8000 or timestamp_delta <= 0:
+            continue
+        sequence_missing = sequence_delta - 1
+        timestamp_missing = max(0, round(timestamp_delta / nominal_packet_samples) - 1)
+        inferred_missing = min(sequence_missing, timestamp_missing)
+        if inferred_missing == 0:
+            continue
+        lost_packets += inferred_missing
+        loss_events += 1
+        missing_samples = max(0, timestamp_delta - len(previous.payload))
+        longest_gap_ms = max(longest_gap_ms, missing_samples * 1000 / rate)
+
+    received_packets = len(unique_packets)
+    expected_packets = received_packets + lost_packets
+    loss_rate = lost_packets / expected_packets if expected_packets else 0.0
+    jitter_ms = jitter_seconds * 1000
+    reasons = _stutter_reasons(loss_rate, longest_gap_ms, jitter_ms)
+    return RtpQuality(
+        received_packets=received_packets,
+        lost_packets=lost_packets,
+        loss_events=loss_events,
+        loss_rate=loss_rate,
+        longest_gap_ms=longest_gap_ms,
+        jitter_ms=jitter_ms,
+        out_of_order_packets=out_of_order_packets,
+        duplicate_packets=duplicate_packets,
+        suspected_stutter=bool(reasons),
+        reasons=reasons,
+    )
+
+
+def analyze_stream_group_quality(streams: list[Stream]) -> RtpQuality:
+    qualities = [analyze_stream_quality(stream) for stream in streams]
+    received_packets = sum(item.received_packets for item in qualities)
+    lost_packets = sum(item.lost_packets for item in qualities)
+    expected_packets = received_packets + lost_packets
+    loss_rate = lost_packets / expected_packets if expected_packets else 0.0
+    longest_gap_ms = max((item.longest_gap_ms for item in qualities), default=0.0)
+    jitter_ms = max((item.jitter_ms for item in qualities), default=0.0)
+    reasons = _stutter_reasons(loss_rate, longest_gap_ms, jitter_ms)
+    return RtpQuality(
+        received_packets=received_packets,
+        lost_packets=lost_packets,
+        loss_events=sum(item.loss_events for item in qualities),
+        loss_rate=loss_rate,
+        longest_gap_ms=longest_gap_ms,
+        jitter_ms=jitter_ms,
+        out_of_order_packets=sum(item.out_of_order_packets for item in qualities),
+        duplicate_packets=sum(item.duplicate_packets for item in qualities),
+        suspected_stutter=bool(reasons),
+        reasons=reasons,
+    )
+
+
 def render_stream(stream: Stream, global_start: float, rate: int = 8000) -> tuple[int, array[int]]:
-    unique: dict[int, RtpPacket] = {}
+    unique: dict[tuple[int, int], RtpPacket] = {}
     for packet in sorted(stream.packets, key=lambda item: item.time):
-        unique.setdefault(packet.sequence, packet)
+        unique.setdefault((packet.sequence, packet.timestamp), packet)
     packets = sorted(unique.values(), key=lambda item: item.time)
     first = packets[0]
     start = max(0, round((first.time - global_start) * rate))
@@ -683,6 +809,20 @@ def group_streams_by_direction(streams: list[Stream]) -> list[list[Stream]]:
     )
 
 
+def stream_group_direction(streams: list[Stream]) -> str:
+    directions = sorted({f"{stream.key[0]}:{stream.key[1]} -> {stream.key[2]}:{stream.key[3]}" for stream in streams})
+    return " | ".join(directions)
+
+
+def stream_group_codecs(streams: list[Stream]) -> str:
+    codecs = {
+        f"{STATIC_CODECS[stream.payload_type][0]}(PT={stream.payload_type})"
+        for stream in streams
+        if stream.payload_type in STATIC_CODECS
+    }
+    return " | ".join(sorted(codecs))
+
+
 def prepare_direct_wav(source: Path, output: Path, channel_mode: str) -> list[Result]:
     if channel_mode == "mixed":
         return [Result(source, direct_wav=True, channel="混合", wav=source, note="直接识别 WAV")]
@@ -751,6 +891,8 @@ def process_capture(source: Path, output: Path, status_filter: str, channel_mode
         result.answered = answered
         result.stream_count = len(streams)
         result.packet_count = packet_count
+        result.rtp_direction = stream_group_direction(streams)
+        result.codecs = stream_group_codecs(streams)
         if status_filter == "answered" and not answered or status_filter == "unanswered" and answered:
             result.note = "已按接通状态跳过" + warning
             return [result]
@@ -782,7 +924,10 @@ def process_capture(source: Path, output: Path, status_filter: str, channel_mode
                     wav=channel_path,
                     stream_count=len(group),
                     packet_count=sum(len(stream.packets) for stream in group),
+                    rtp_direction=stream_group_direction(group),
+                    codecs=stream_group_codecs(group),
                     duration=len(samples) / 8000,
+                    quality=analyze_stream_group_quality(group),
                     note=f"声道导出成功；双声道文件：{stereo_path}{warning}",
                 ))
             return channel_results
@@ -795,6 +940,7 @@ def process_capture(source: Path, output: Path, status_filter: str, channel_mode
         result.channel = "混合" if len(direction_groups) > 1 else "单声道"
         result.wav = target
         result.duration = len(samples) / 8000
+        result.quality = analyze_stream_group_quality(streams)
         fallback = "（检测到超过两个 RTP 方向，已回退混合模式）" if channel_mode == "separate" and len(direction_groups) > 2 else ""
         result.note = "导出成功" + fallback + warning
     except (OSError, CaptureError, struct.error, ValueError) as error:
@@ -879,6 +1025,18 @@ def classification_text(result: Result) -> str:
     return result.translated_text or result.transcript
 
 
+def stutter_label(result: Result) -> str:
+    if result.quality is None:
+        return "无法判断（无RTP）" if result.direct_wav else "无法判断"
+    return "是" if result.quality.suspected_stutter else "否"
+
+
+def stutter_evidence(result: Result) -> str:
+    if result.quality is None:
+        return "无 RTP 时序数据" if result.direct_wav else "无有效 RTP 媒体流"
+    return "；".join(result.quality.reasons) if result.quality.reasons else "未达到判定阈值"
+
+
 def normalize_transcript(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text).casefold()
     normalized = "".join(character for character in normalized if character.isalnum())
@@ -952,6 +1110,18 @@ def write_report(output: Path, results: list[Result]) -> Path:
             "RTP流数",
             "RTP包数",
             "时长秒",
+            "RTP方向",
+            "编码",
+            "有效RTP包数",
+            "推测丢包数",
+            "丢包事件数",
+            "丢包率",
+            "最长连续缺口毫秒",
+            "RTP抖动毫秒",
+            "乱序包数",
+            "重复包数",
+            "疑似卡顿",
+            "卡顿依据",
             "检测语言",
             "语言置信度",
             "识别原文",
@@ -963,6 +1133,7 @@ def write_report(output: Path, results: list[Result]) -> Path:
             "结果",
         ])
         for item in results:
+            quality = item.quality
             writer.writerow([
                 str(item.source),
                 result_status(item),
@@ -971,6 +1142,18 @@ def write_report(output: Path, results: list[Result]) -> Path:
                 item.stream_count,
                 item.packet_count,
                 f"{item.duration:.3f}" if item.duration else "",
+                item.rtp_direction,
+                item.codecs,
+                quality.received_packets if quality else "",
+                quality.lost_packets if quality else "",
+                quality.loss_events if quality else "",
+                f"{quality.loss_rate:.2%}" if quality else "",
+                f"{quality.longest_gap_ms:.1f}" if quality else "",
+                f"{quality.jitter_ms:.1f}" if quality else "",
+                quality.out_of_order_packets if quality else "",
+                quality.duplicate_packets if quality else "",
+                stutter_label(item),
+                stutter_evidence(item),
                 language_label(item.detected_language),
                 f"{item.language_probability:.2%}" if item.detected_language else "",
                 item.transcript,
@@ -1127,11 +1310,12 @@ def main(argv: list[str] | None = None) -> int:
     asr_failed = sum(item.asr_note.startswith("识别失败") for item in results)
     translation_failed = sum(item.translation_note.startswith("翻译失败") for item in results)
     category_message = f"，提示音分类 {len(groups)} 个；分类汇总：{category_report}" if category_report else ""
-    translation_message = f"，翻译失败 {translation_failed} 个" if not args.no_translate else ""
+    asr_message = f"，ASR失败 {asr_failed} 个" if args.asr else ""
+    translation_message = f"，翻译失败 {translation_failed} 个" if args.asr and not args.no_translate else ""
     if direct_wav:
         print(f"完成：识别 {len(results)} 个声道，ASR失败 {asr_failed} 个{translation_message}{category_message}；报告：{report}")
     else:
-        print(f"完成：导出 {exported} 个 WAV，抓包失败 {failed} 个，ASR失败 {asr_failed} 个{translation_message}{category_message}；报告：{report}")
+        print(f"完成：导出 {exported} 个 WAV，抓包失败 {failed} 个{asr_message}{translation_message}{category_message}；报告：{report}")
     return 2 if failed or asr_failed or translation_failed else 0
 
 

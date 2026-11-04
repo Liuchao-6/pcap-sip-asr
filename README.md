@@ -6,6 +6,7 @@
 - 没有发现上述响应时判定为“未接通”。
 - 将双向 G.711 PCMA（Payload Type 8）和 PCMU（Payload Type 0）RTP 音频默认导出为双声道 WAV，并生成左右单声道文件供独立识别和翻译。
 - 输出 `导出报告.csv`，便于按文件查看状态、录音时长和失败原因。
+- 无需启用 ASR 即可按 RTP 方向统计丢包、连续缺口、抖动、乱序和重复包，并在报告中标记是否疑似卡顿。
 - 可选使用本地 `faster-whisper` 对未接通、已接通或全部录音执行多语言 ASR，自动检测语言并默认翻译成中文。
 - 指定单个 WAV 时不再解析 SIP，也不复制或修改原文件，直接执行 ASR 并生成识别报告。
 
@@ -98,6 +99,22 @@ python3.10 pcapsip2wav.py INPUT [-o OUTPUT]
 python3.10 pcapsip2wav.py /data/pcap -o /data/wav_output \
   --channel-mode mixed --asr
 ```
+
+## RTP 卡顿检测
+
+卡顿检测始终启用，不依赖 `--asr`。最简单的检查命令：
+
+```bash
+python3.10 pcapsip2wav.py /data/pcap -o /data/wav_output
+```
+
+`导出报告.csv` 按声道提供 RTP 方向、编码、有效包数、推测丢包数、丢包事件数、丢包率、最长连续缺口、RFC 3550 抖动、乱序包数、重复包数、“疑似卡顿”和“卡顿依据”。当前任一条件满足即标记为“是”：
+
+- 丢包率达到 `1%`；
+- 单次连续音频缺口达到 `40 ms`；
+- RTP 抖动达到 `30 ms`。
+
+直接输入 WAV 时没有 RTP 序号、时间戳和网络到达时间，报告标记“无法判断（无RTP）”。抓包结果反映该采集点观察到的 RTP 风险；终端 jitter buffer、PLC 补偿、抓包自身漏包及采集位置都可能影响用户实际听感，因此“疑似卡顿”不是最终听感结论。
 
 ## CentOS 7 提示音识别
 
